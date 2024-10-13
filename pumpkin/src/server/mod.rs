@@ -1,6 +1,5 @@
 use connection_cache::{CachedBranding, CachedStatus};
 use key_store::KeyStore;
-use mio::Token;
 use parking_lot::{Mutex, RwLock};
 use pumpkin_config::BASIC_CONFIG;
 use pumpkin_core::GameMode;
@@ -95,7 +94,7 @@ impl Server {
         }
     }
 
-    pub async fn add_player(&self, token: Token, client: Arc<Client>) -> (Arc<Player>, Arc<World>) {
+    pub async fn add_player(&self, token: u32, client: Arc<Client>) -> (Arc<Player>, Arc<World>) {
         let entity_id = self.new_entity_id();
         let gamemode = match BASIC_CONFIG.default_gamemode {
             GameMode::Undefined => GameMode::Survival,

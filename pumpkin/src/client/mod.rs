@@ -2,7 +2,7 @@ use std::{
     io::{self, Write},
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicI32},
+        atomic::{AtomicBool, AtomicI32, Ordering},
         Arc,
     },
 };
@@ -14,7 +14,6 @@ use crate::{
 
 use authentication::GameProfile;
 use crossbeam::atomic::AtomicCell;
-use mio::{event::Event, net::TcpStream, Token};
 use parking_lot::Mutex;
 use pumpkin_config::compression::CompressionInfo;
 use pumpkin_core::text::TextComponent;
@@ -32,8 +31,11 @@ use pumpkin_protocol::{
     ClientPacket, ConnectionState, PacketError, RawPacket, ServerPacket,
 };
 
-use std::io::Read;
 use thiserror::Error;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+};
 
 pub mod authentication;
 mod client_packet;
@@ -100,9 +102,10 @@ pub struct Client {
     /// Indicates if the client connection is closed.
     pub closed: AtomicBool,
     /// A unique token identifying the client.
-    pub token: Token,
-    /// The underlying TCP connection to the client.
-    pub connection: Arc<Mutex<TcpStream>>,
+    pub token: u32,
+    /// The underlying TCP connections to the client.
+    pub connection_read: Arc<Mutex<OwnedReadHalf>>,
+    pub connection_write: Arc<Mutex<OwnedWriteHalf>>,
     /// The client's IP address.
     pub address: Mutex<SocketAddr>,
     /// The packet encoder for outgoing packets.
@@ -122,11 +125,12 @@ pub struct Client {
 
 impl Client {
     pub fn new(
-        token: Token,
-        connection: TcpStream,
+        token: u32,
+        connection: tokio::net::TcpStream,
         address: SocketAddr,
         keep_alive_sender: Arc<tokio::sync::mpsc::Sender<i64>>,
     ) -> Self {
+        let (connection_read, connection_write) = connection.into_split();
         Self {
             protocol_version: AtomicI32::new(0),
             gameprofile: Mutex::new(None),
@@ -135,7 +139,8 @@ impl Client {
             token,
             address: Mutex::new(address),
             connection_state: AtomicCell::new(ConnectionState::HandShake),
-            connection: Arc::new(Mutex::new(connection)),
+            connection_read: Arc::new(Mutex::new(connection_read)),
+            connection_write: Arc::new(Mutex::new(connection_write)),
             enc: Arc::new(Mutex::new(PacketEncoder::default())),
             dec: Arc::new(Mutex::new(PacketDecoder::default())),
             encryption: AtomicBool::new(false),
@@ -180,26 +185,34 @@ impl Client {
     }
 
     /// Send a Clientbound Packet to the Client
-    pub fn send_packet<P: ClientPacket>(&self, packet: &P) {
+    pub async fn send_packet<P: ClientPacket>(&self, packet: &P) {
         // assert!(!self.closed);
         let mut enc = self.enc.lock();
-        enc.append_packet(packet)
-            .unwrap_or_else(|e| self.kick(&e.to_string()));
-        self.connection
+        if let Err(error) = enc.append_packet(packet) {
+            self.kick(&error.to_string()).await;
+            return;
+        }
+        if let Err(error) = self
+            .connection_write
             .lock()
             .write_all(&enc.take())
+            .await
             .map_err(|_| PacketError::ConnectionWrite)
-            .unwrap_or_else(|e| self.kick(&e.to_string()));
+        {
+            self.kick(&error.to_string()).await;
+            return;
+        }
     }
 
-    pub fn try_send_packet<P: ClientPacket>(&self, packet: &P) -> Result<(), PacketError> {
+    pub async fn try_send_packet<P: ClientPacket>(&self, packet: &P) -> Result<(), PacketError> {
         // assert!(!self.closed);
 
         let mut enc = self.enc.lock();
         enc.append_packet(packet)?;
-        self.connection
+        self.connection_write
             .lock()
             .write_all(&enc.take())
+            .await
             .map_err(|_| PacketError::ConnectionWrite)?;
         Ok(())
     }
@@ -207,11 +220,11 @@ impl Client {
     /// Processes all packets send by the client
     pub async fn process_packets(&self, server: &Arc<Server>) {
         while let Some(mut packet) = self.client_packets_queue.lock().pop() {
-            let _ = self.handle_packet(server, &mut packet).await.map_err(|e| {
-                let text = format!("Error while reading incoming packet {}", e);
+            if let Err(error) = self.handle_packet(server, &mut packet).await {
+                let text = format!("Error while reading incoming packet {}", error);
                 log::error!("{}", text);
-                self.kick(&text)
-            });
+                self.kick(&text).await
+            };
         }
     }
 
@@ -360,21 +373,32 @@ impl Client {
 
     /// Reads the connection until our buffer of len 4096 is full, then decode
     /// Close connection when an error occurs or when the Client closed the connection
-    pub async fn poll(&self, event: &Event) {
-        if event.is_readable() {
-            let mut received_data = vec![];
+    pub async fn poll(&self) {
+        while !self.closed.load(Ordering::Relaxed) {
             let mut buf = [0; 4096];
             loop {
-                let connection = self.connection.clone();
+                let connection = self.connection_read.clone();
                 let mut connection = connection.lock();
-                match connection.read(&mut buf) {
+                match connection.read(&mut buf).await {
                     Ok(0) => {
                         // Reading 0 bytes means the other side has closed the
                         // connection or is done writing, then so are we.
                         self.close();
                         break;
                     }
-                    Ok(n) => received_data.extend(&buf[..n]),
+                    Ok(n) => {
+                        let mut dec = self.dec.lock();
+                        dec.queue_slice(&buf[..n]);
+                        match dec.decode() {
+                            Ok(packet) => {
+                                if let Some(packet) = packet {
+                                    self.add_packet(packet);
+                                }
+                            }
+                            Err(err) => self.kick(&err.to_string()).await,
+                        }
+                        dec.clear();
+                    }
                     // Would block "errors" are the OS's way of saying that the
                     // connection is not actually ready to perform this I/O operation.
                     Err(ref err) if would_block(err) => break,
@@ -383,40 +407,29 @@ impl Client {
                     Err(_) => self.close(),
                 }
             }
-
-            if !received_data.is_empty() {
-                let mut dec = self.dec.lock();
-                dec.queue_slice(&received_data);
-                match dec.decode() {
-                    Ok(packet) => {
-                        if let Some(packet) = packet {
-                            self.add_packet(packet);
-                        }
-                    }
-                    Err(err) => self.kick(&err.to_string()),
-                }
-                dec.clear();
-            }
         }
     }
 
     /// Kicks the Client with a reason depending on the connection state
-    pub fn kick(&self, reason: &str) {
+    pub async fn kick(&self, reason: &str) {
         dbg!(reason);
         match self.connection_state.load() {
             ConnectionState::Login => {
                 self.try_send_packet(&CLoginDisconnect::new(
                     &serde_json::to_string_pretty(&reason).unwrap_or_else(|_| "".into()),
                 ))
+                .await
                 .unwrap_or_else(|_| self.close());
             }
             ConnectionState::Config => {
                 self.try_send_packet(&CConfigDisconnect::new(reason))
+                    .await
                     .unwrap_or_else(|_| self.close());
             }
             // This way players get kicked when players using client functions (e.g. poll, send_packet)
             ConnectionState::Play => {
                 self.try_send_packet(&CPlayDisconnect::new(&TextComponent::text(reason)))
+                    .await
                     .unwrap_or_else(|_| self.close());
             }
             _ => {

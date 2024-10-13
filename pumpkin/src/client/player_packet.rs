@@ -41,7 +41,7 @@ fn modulus(a: f32, b: f32) -> f32 {
 /// Handles all Play Packets send by a real Player
 /// NEVER TRUST THE CLIENT. HANDLE EVERY ERROR, UNWRAP/EXPECT ARE FORBIDDEN
 impl Player {
-    pub fn handle_confirm_teleport(
+    pub async fn handle_confirm_teleport(
         &self,
         _server: &Arc<Server>,
         confirm_teleport: SConfirmTeleport,
@@ -56,12 +56,13 @@ impl Player {
 
                 *awaiting_teleport = None;
             } else {
-                self.kick(TextComponent::text("Wrong teleport id"))
+                self.kick(TextComponent::text("Wrong teleport id")).await
             }
         } else {
             self.kick(TextComponent::text(
                 "Send Teleport confirm, but we did not teleport",
             ))
+            .await
         }
     }
 
@@ -288,6 +289,7 @@ impl Player {
             }
         } else {
             self.kick(TextComponent::text("Invalid player command"))
+                .await
         }
     }
 
@@ -351,7 +353,7 @@ impl Player {
         ) */
     }
 
-    pub fn handle_client_information_play(
+    pub async fn handle_client_information_play(
         &self,
         _server: &Arc<Server>,
         client_information: SClientInformationPlay,
@@ -372,6 +374,7 @@ impl Player {
             };
         } else {
             self.kick(TextComponent::text("Invalid hand or chat type"))
+                .await
         }
     }
 
@@ -419,7 +422,7 @@ impl Player {
                                     .store(velocity.multiply(0.6, 1.0, 0.6));
 
                                 victem_entity.velocity.store(saved_velo);
-                                player.client.send_packet(packet);
+                                player.client.send_packet(packet).await;
                             }
                             if config.hurt_animation {
                                 world.broadcast_packet_all(&CHurtAnimation::new(
@@ -430,6 +433,7 @@ impl Player {
                             if config.swing {}
                         } else {
                             self.kick(TextComponent::text("Interacted with invalid entity id"))
+                                .await
                         }
                     }
                 }
@@ -440,7 +444,7 @@ impl Player {
                     dbg!("todo");
                 }
             },
-            None => self.kick(TextComponent::text("Invalid action type")),
+            None => self.kick(TextComponent::text("Invalid action type")).await,
         }
     }
     pub async fn handle_player_action(&self, _server: &Arc<Server>, player_action: SPlayerAction) {
@@ -503,7 +507,7 @@ impl Player {
                     dbg!("todo");
                 }
             },
-            None => self.kick(TextComponent::text("Invalid status")),
+            None => self.kick(TextComponent::text("Invalid status")).await,
         }
     }
 
@@ -543,7 +547,7 @@ impl Player {
             self.client
                 .send_packet(&CAcknowledgeBlockChange::new(use_item_on.sequence));
         } else {
-            self.kick(TextComponent::text("Invalid block face"))
+            self.kick(TextComponent::text("Invalid block face")).await
         }
     }
 
@@ -552,10 +556,10 @@ impl Player {
         log::error!("An item was used(SUseItem), but the packet is not implemented yet");
     }
 
-    pub fn handle_set_held_item(&self, _server: &Arc<Server>, held: SSetHeldItem) {
+    pub async fn handle_set_held_item(&self, _server: &Arc<Server>, held: SSetHeldItem) {
         let slot = held.slot;
         if !(0..=8).contains(&slot) {
-            self.kick(TextComponent::text("Invalid held slot"))
+            self.kick(TextComponent::text("Invalid held slot")).await
         }
         self.inventory.lock().set_selected(slot as usize);
     }

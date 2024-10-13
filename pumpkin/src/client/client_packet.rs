@@ -107,8 +107,10 @@ impl Client {
     ) {
         let shared_secret = server.decrypt(&encryption_response.shared_secret).unwrap();
 
-        self.set_encryption(Some(&shared_secret))
-            .unwrap_or_else(|e| self.kick(&e.to_string()));
+        if let Err(error) = self.set_encryption(Some(&shared_secret)) {
+            self.kick(&error.to_string());
+            return;
+        }
 
         let mut gameprofile = self.gameprofile.lock();
 
@@ -133,7 +135,7 @@ impl Client {
                             .allow_banned_players
                         {
                             if !actions.is_empty() {
-                                self.kick("Your account can't join");
+                                self.kick("Your account can't join").await;
                             }
                         } else {
                             for allowed in &ADVANCED_CONFIG
@@ -142,19 +144,22 @@ impl Client {
                                 .allowed_actions
                             {
                                 if !actions.contains(allowed) {
-                                    self.kick("Your account can't join");
+                                    self.kick("Your account can't join").await;
                                 }
                             }
                         }
                     }
                     *gameprofile = Some(profile);
                 }
-                Err(e) => self.kick(&e.to_string()),
+                Err(e) => self.kick(&e.to_string()).await,
             }
         }
         for property in &gameprofile.as_ref().unwrap().properties {
-            unpack_textures(property, &ADVANCED_CONFIG.authentication.textures)
-                .unwrap_or_else(|e| self.kick(&e.to_string()));
+            if let Err(error) = unpack_textures(property, &ADVANCED_CONFIG.authentication.textures)
+            {
+                self.kick(&error.to_string()).await;
+                return;
+            }
         }
 
         // enable compression
@@ -215,7 +220,7 @@ impl Client {
         }]));
         dbg!("login acknowledged");
     }
-    pub fn handle_client_information_config(
+    pub async fn handle_client_information_config(
         &self,
         _server: &Arc<Server>,
         client_information: SClientInformationConfig,
@@ -236,18 +241,22 @@ impl Client {
                 server_listing: client_information.server_listing,
             });
         } else {
-            self.kick("Invalid hand or chat type")
+            self.kick("Invalid hand or chat type").await
         }
     }
 
-    pub fn handle_plugin_message(&self, _server: &Arc<Server>, plugin_message: SPluginMessage) {
+    pub async fn handle_plugin_message(
+        &self,
+        _server: &Arc<Server>,
+        plugin_message: SPluginMessage,
+    ) {
         if plugin_message.channel.starts_with("minecraft:brand")
             || plugin_message.channel.starts_with("MC|Brand")
         {
             dbg!("got a client brand");
             match String::from_utf8(plugin_message.data) {
                 Ok(brand) => *self.brand.lock() = Some(brand),
-                Err(e) => self.kick(&e.to_string()),
+                Err(e) => self.kick(&e.to_string()).await,
             }
         }
     }

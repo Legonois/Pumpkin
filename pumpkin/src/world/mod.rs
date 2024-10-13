@@ -6,7 +6,6 @@ use crate::{
     client::Client,
     entity::{player::Player, Entity},
 };
-use mio::Token;
 use num_traits::ToPrimitive;
 use parking_lot::Mutex;
 use pumpkin_config::BasicConfiguration;
@@ -35,7 +34,7 @@ pub struct World {
     /// The underlying level, responsible for chunk management and terrain generation.
     pub level: Arc<Mutex<Level>>,
     /// A map of active players within the world, keyed by their unique token.
-    pub current_players: Arc<Mutex<HashMap<Token, Arc<Player>>>>,
+    pub current_players: Arc<Mutex<HashMap<u32, Arc<Player>>>>,
     // TODO: entities
 }
 
@@ -67,7 +66,7 @@ impl World {
     /// Sends the specified packet to every player currently logged in to the server, excluding the players listed in the `except` parameter.
     ///
     /// **Note:** This function acquires a lock on the `current_players` map, ensuring thread safety.
-    pub fn broadcast_packet_expect<P>(&self, except: &[Token], packet: &P)
+    pub fn broadcast_packet_expect<P>(&self, except: &[u32], packet: &P)
     where
         P: ClientPacket,
     {
@@ -189,21 +188,24 @@ impl World {
             let entity = &existing_player.living_entity.entity;
             let pos = entity.pos.load();
             let gameprofile = &existing_player.gameprofile;
-            player.client.send_packet(&CSpawnEntity::new(
-                existing_player.entity_id().into(),
-                gameprofile.id,
-                (EntityType::Player as i32).into(),
-                pos.x,
-                pos.y,
-                pos.z,
-                entity.yaw.load(),
-                entity.pitch.load(),
-                entity.head_yaw.load(),
-                0.into(),
-                0.0,
-                0.0,
-                0.0,
-            ))
+            player
+                .client
+                .send_packet(&CSpawnEntity::new(
+                    existing_player.entity_id().into(),
+                    gameprofile.id,
+                    (EntityType::Player as i32).into(),
+                    pos.x,
+                    pos.y,
+                    pos.z,
+                    entity.yaw.load(),
+                    entity.pitch.load(),
+                    entity.head_yaw.load(),
+                    0.into(),
+                    0.0,
+                    0.0,
+                    0.0,
+                ))
+                .await
         }
         // entity meta data
         // set skin parts
@@ -279,7 +281,7 @@ impl World {
         None
     }
 
-    pub fn add_player(&self, token: Token, player: Arc<Player>) {
+    pub fn add_player(&self, token: u32, player: Arc<Player>) {
         self.current_players.lock().insert(token, player);
     }
 

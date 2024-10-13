@@ -84,11 +84,12 @@ impl Player {
     }
 
     /// The official Minecraft client is weird, and will always just close *any* window that is opened when this gets sent
-    pub fn close_container(&self) {
+    pub async fn close_container(&self) {
         let mut inventory = self.inventory.lock();
         inventory.total_opened_containers += 1;
         self.client
             .send_packet(&CCloseContainer::new(inventory.total_opened_containers))
+            .await
     }
 
     pub fn set_container_property<T: WindowPropertyTrait>(

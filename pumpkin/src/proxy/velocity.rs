@@ -35,7 +35,7 @@ pub fn check_integrity(data: (&[u8], &[u8]), secret: String) -> bool {
     mac.verify_slice(signature).is_ok()
 }
 
-pub fn receive_plugin_response(
+pub async fn receive_plugin_response(
     client: &Client,
     config: VelocityConfig,
     response: SLoginPluginResponse,
@@ -65,6 +65,8 @@ pub fn receive_plugin_response(
         *client.address.lock() = addr;
         todo!()
     } else {
-        client.kick("This server requires you to connect with Velocity.")
+        client
+            .kick("This server requires you to connect with Velocity.")
+            .await
     }
 }

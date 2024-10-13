@@ -214,7 +214,7 @@ impl Player {
     }
 
     /// Kicks the Client with a reason depending on the connection state
-    pub fn kick(&self, reason: TextComponent) {
+    pub async fn kick<'a>(&self, reason: TextComponent<'a>) {
         assert!(!self
             .client
             .closed
@@ -222,7 +222,7 @@ impl Player {
 
         self.client
             .try_send_packet(&CPlayDisconnect::new(&reason))
-            .unwrap_or_else(|_| self.client.close());
+            .await;
         log::info!(
             "Kicked {} for {}",
             self.gameprofile.name,
@@ -280,7 +280,7 @@ impl Player {
                 Err(e) => {
                     let text = format!("Error while reading incoming packet {}", e);
                     log::error!("{}", text);
-                    self.kick(TextComponent::text(&text))
+                    self.kick(TextComponent::text(&text)).await
                 }
             };
         }
