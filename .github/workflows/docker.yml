@@ -27,4 +27,4 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/user/app:nightly
+            ghcr.io/${{ github.repository_owner }}/${{ github.repository }}:nightly
