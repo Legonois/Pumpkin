@@ -15,7 +15,7 @@
 		"vscode": {
 			"extensions": [
 				"eamodio.gitlens",
-				"Swellaby.rust-pack"
+				"fill-labs.dependi"
 			]
 		}
 	}
