@@ -1,11 +1,12 @@
 use pumpkin_core::math::position::WorldPosition;
-use pumpkin_macros::packet;
+
+use pumpkin_macros::client_packet;
 use serde::Serialize;
 
 use crate::VarInt;
 
 #[derive(Serialize)]
-#[packet(0x2B)]
+#[client_packet("play:login")]
 pub struct CLogin<'a> {
     entity_id: i32,
     is_hardcore: bool,
@@ -17,6 +18,7 @@ pub struct CLogin<'a> {
     reduced_debug_info: bool,
     enabled_respawn_screen: bool,
     limited_crafting: bool,
+    // Spawn Info
     dimension_type: VarInt,
     dimension_name: &'a str,
     hashed_seed: i64,
@@ -26,6 +28,7 @@ pub struct CLogin<'a> {
     is_flat: bool,
     death_dimension_name: Option<(WorldPosition, i64)>,
     portal_cooldown: VarInt,
+    sealevel: VarInt,
     enforce_secure_chat: bool,
 }
 
@@ -50,6 +53,7 @@ impl<'a> CLogin<'a> {
         is_flat: bool,
         death_dimension_name: Option<(WorldPosition, i64)>,
         portal_cooldown: VarInt,
+        sealevel: VarInt,
         enforce_secure_chat: bool,
     ) -> Self {
         Self {
@@ -72,6 +76,7 @@ impl<'a> CLogin<'a> {
             is_flat,
             death_dimension_name,
             portal_cooldown,
+            sealevel,
             enforce_secure_chat,
         }
     }

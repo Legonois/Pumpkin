@@ -1,4 +1,4 @@
-use num_traits::FromPrimitive;
+use num_traits::{FromPrimitive, ToPrimitive};
 use pumpkin_config::{ADVANCED_CONFIG, BASIC_CONFIG};
 use pumpkin_core::text::TextComponent;
 use pumpkin_protocol::{
@@ -18,9 +18,12 @@ use pumpkin_protocol::{
 use uuid::Uuid;
 
 use crate::{
-    client::authentication::{self, validate_textures, GameProfile},
+    client::authentication::{self, offline_uuid, validate_textures, GameProfile},
     entity::player::{ChatMode, Hand},
-    proxy::velocity::velocity_login,
+    proxy::{
+        bungeecord,
+        velocity::{self, velocity_login},
+    },
     server::{Server, CURRENT_MC_VERSION},
 };
 
@@ -29,36 +32,39 @@ use super::{authentication::AuthError, Client, PlayerConfig};
 /// Processes incoming Packets from the Client to the Server
 /// Implements the `Client` Packets
 /// NEVER TRUST THE CLIENT. HANDLE EVERY ERROR, UNWRAP/EXPECT
-/// TODO: REMOVE ALL UNWRAPS
 impl Client {
-    pub fn handle_handshake(&self, handshake: SHandShake) {
-        dbg!("handshake");
+    pub async fn handle_handshake(&self, handshake: SHandShake) {
         let version = handshake.protocol_version.0;
         self.protocol_version
             .store(version, std::sync::atomic::Ordering::Relaxed);
+        *self.server_address.lock().await = handshake.server_address;
 
+        log::debug!("Handshake: next state {:?}", &handshake.next_state);
         self.connection_state.store(handshake.next_state);
         if self.connection_state.load() != ConnectionState::Status {
             let protocol = version;
             match protocol.cmp(&(CURRENT_MC_PROTOCOL as i32)) {
                 std::cmp::Ordering::Less => {
-                    self.kick(&format!("Client outdated ({protocol}), Server uses Minecraft {CURRENT_MC_VERSION}, Protocol {CURRENT_MC_PROTOCOL}"));
+                    self.kick(&format!("Client outdated ({protocol}), Server uses Minecraft {CURRENT_MC_VERSION}, Protocol {CURRENT_MC_PROTOCOL}")).await;
                 }
                 std::cmp::Ordering::Equal => {}
                 std::cmp::Ordering::Greater => {
-                    self.kick(&format!("Server outdated, Server uses Minecraft {CURRENT_MC_VERSION}, Protocol {CURRENT_MC_PROTOCOL}"));
+                    self.kick(&format!("Server outdated, Server uses Minecraft {CURRENT_MC_VERSION}, Protocol {CURRENT_MC_PROTOCOL}")).await;
                 }
             }
         }
     }
 
-    pub fn handle_status_request(&self, server: &Server, _status_request: SStatusRequest) {
-        self.send_packet(&server.get_status());
+    pub async fn handle_status_request(&self, server: &Server, _status_request: SStatusRequest) {
+        log::debug!("Handling status request for id");
+        let status = server.get_status();
+        self.send_packet(&status.lock().await.get_status()).await;
     }
 
-    pub fn handle_ping_request(&self, ping_request: SStatusPingRequest) {
-        dbg!("ping");
-        self.send_packet(&CPingResponse::new(ping_request.payload));
+    pub async fn handle_ping_request(&self, ping_request: SStatusPingRequest) {
+        log::debug!("Handling ping request for id");
+        self.send_packet(&CPingResponse::new(ping_request.payload))
+            .await;
         self.close();
     }
 
@@ -69,33 +75,71 @@ impl Client {
                 .all(|c| c > 32_u8 as char && c < 127_u8 as char)
     }
 
-    pub fn handle_login_start(&self, server: &Server, login_start: SLoginStart) {
-        log::debug!("login start, State {:?}", self.connection_state);
+    pub async fn handle_login_start(&self, server: &Server, login_start: SLoginStart) {
+        log::debug!("login start");
+
+        // Don't allow new logons when server is full.
+        // If max players is set to zero, then there is no max player count enforced.
+        // TODO: If client is an operator or otherwise suitable elevated permissions, allow client to bypass this requirement.
+        let max_players = BASIC_CONFIG
+            .max_players
+            .to_usize()
+            .expect("Unable to convert to usize");
+        if max_players > 0 && server.get_player_count().await >= max_players {
+            self.kick("The server is currently full, please try again later")
+                .await;
+        }
 
         if !Self::is_valid_player_name(&login_start.name) {
-            self.kick("Invalid characters in username");
+            self.kick("Invalid characters in username").await;
             return;
         }
         // default game profile, when no online mode
         // TODO: make offline uuid
-        let mut gameprofile = self.gameprofile.lock();
-        *gameprofile = Some(GameProfile {
-            id: login_start.uuid,
-            name: login_start.name,
-            properties: vec![],
-            profile_actions: None,
-        });
+        let mut gameprofile = self.gameprofile.lock().await;
         let proxy = &ADVANCED_CONFIG.proxy;
         if proxy.enabled {
             if proxy.velocity.enabled {
-                velocity_login(self)
+                velocity_login(self).await;
+            } else if proxy.bungeecord.enabled {
+                match bungeecord::bungeecord_login(self, login_start.name).await {
+                    Ok((_ip, profile)) => {
+                        // self.address.lock() = ip;
+                        self.finish_login(&profile).await;
+                        *gameprofile = Some(profile);
+                    }
+                    Err(error) => self.kick(&error.to_string()).await,
+                }
             }
-            return;
-        }
+        } else {
+            let id = if BASIC_CONFIG.online_mode {
+                login_start.uuid
+            } else {
+                offline_uuid(&login_start.name).expect("This is very not safe and bad")
+            };
 
-        // TODO: check config for encryption
-        let verify_token: [u8; 4] = rand::random();
-        self.send_packet(&server.encryption_request(&verify_token, BASIC_CONFIG.online_mode));
+            let profile = GameProfile {
+                id,
+                name: login_start.name,
+                properties: vec![],
+                profile_actions: None,
+            };
+
+            if BASIC_CONFIG.encryption {
+                let verify_token: [u8; 4] = rand::random();
+                self.send_packet(
+                    &server.encryption_request(&verify_token, BASIC_CONFIG.online_mode),
+                )
+                .await;
+            } else {
+                if ADVANCED_CONFIG.packet_compression.enabled {
+                    self.enable_compression().await;
+                }
+                self.finish_login(&profile).await;
+            }
+
+            *gameprofile = Some(profile);
+        }
     }
 
     pub async fn handle_encryption_response(
@@ -103,41 +147,69 @@ impl Client {
         server: &Server,
         encryption_response: SEncryptionResponse,
     ) {
+        log::debug!("Handling encryption for id");
         let shared_secret = server.decrypt(&encryption_response.shared_secret).unwrap();
 
-        self.set_encryption(Some(&shared_secret))
-            .unwrap_or_else(|e| self.kick(&e.to_string()));
+        if let Err(error) = self.set_encryption(Some(&shared_secret)).await {
+            self.kick(&error.to_string()).await;
+            return;
+        }
 
-        let mut gameprofile = self.gameprofile.lock();
+        let mut gameprofile = self.gameprofile.lock().await;
+
+        let Some(profile) = gameprofile.as_mut() else {
+            self.kick("No Game profile").await;
+            return;
+        };
 
         if BASIC_CONFIG.online_mode {
+            // Online mode auth
             match self
-                .autenticate(server, &shared_secret, &gameprofile.as_ref().unwrap().name)
+                .authenticate(server, &shared_secret, &profile.name)
                 .await
             {
-                Ok(profile) => *gameprofile = Some(profile),
+                Ok(new_profile) => *profile = new_profile,
                 Err(e) => {
-                    self.kick(&e.to_string());
+                    self.kick(&e.to_string()).await;
+                    return;
                 }
             }
         }
 
-        // enable compression
-        if ADVANCED_CONFIG.packet_compression.enabled {
-            let compression = ADVANCED_CONFIG.packet_compression.compression_info.clone();
-            self.send_packet(&CSetCompression::new(compression.threshold.into()));
-            self.set_compression(Some(compression));
+        // Don't allow duplicate UUIDs
+        if let Some(online_player) = &server.get_player_by_uuid(profile.id).await {
+            log::debug!("Player (IP '{}', username '{}') tried to log in with the same UUID ('{}') as an online player (IP '{}', username '{}')", &self.address.lock().await, &profile.name, &profile.id, &online_player.client.address.lock().await, &online_player.gameprofile.name);
+            self.kick("You are already connected to this server").await;
+            return;
         }
 
-        if let Some(profile) = gameprofile.as_ref() {
-            let packet = CLoginSuccess::new(&profile.id, &profile.name, &profile.properties, false);
-            self.send_packet(&packet);
-        } else {
-            self.kick("game profile is none");
+        // Don't allow a duplicate username
+        if let Some(online_player) = &server.get_player_by_name(&profile.name).await {
+            log::debug!("A player (IP '{}', attempted username '{}') tried to log in with the same username as an online player (UUID '{}', IP '{}', username '{}')", &self.address.lock().await, &profile.name, &profile.id, &online_player.client.address.lock().await, &online_player.gameprofile.name);
+            self.kick("A player with this username is already connected")
+                .await;
+            return;
         }
+
+        if ADVANCED_CONFIG.packet_compression.enabled {
+            self.enable_compression().await;
+        }
+        self.finish_login(profile).await;
     }
 
-    async fn autenticate(
+    async fn enable_compression(&self) {
+        let compression = ADVANCED_CONFIG.packet_compression.compression_info.clone();
+        self.send_packet(&CSetCompression::new(compression.threshold.into()))
+            .await;
+        self.set_compression(Some(compression)).await;
+    }
+
+    async fn finish_login(&self, profile: &GameProfile) {
+        let packet = CLoginSuccess::new(&profile.id, &profile.name, &profile.properties);
+        self.send_packet(&packet).await;
+    }
+
+    async fn authenticate(
         &self,
         server: &Server,
         shared_secret: &[u8],
@@ -145,29 +217,30 @@ impl Client {
     ) -> Result<GameProfile, AuthError> {
         if let Some(auth_client) = &server.auth_client {
             let hash = server.digest_secret(shared_secret);
-            let ip = self.address.lock().ip();
-
+            let ip = self.address.lock().await.ip();
             let profile = authentication::authenticate(username, &hash, &ip, auth_client).await?;
+
             // Check if player should join
             if let Some(actions) = &profile.profile_actions {
-                if !ADVANCED_CONFIG
+                if ADVANCED_CONFIG
                     .authentication
                     .player_profile
                     .allow_banned_players
                 {
-                    if !actions.is_empty() {
-                        self.kick("Your account can't join");
-                    }
-                } else {
                     for allowed in &ADVANCED_CONFIG
                         .authentication
                         .player_profile
                         .allowed_actions
                     {
                         if !actions.contains(allowed) {
-                            self.kick("Your account can't join");
+                            return Err(AuthError::DisallowedAction);
                         }
                     }
+                    if !actions.is_empty() {
+                        return Err(AuthError::Banned);
+                    }
+                } else if !actions.is_empty() {
+                    return Err(AuthError::Banned);
                 }
             }
             // validate textures
@@ -180,15 +253,34 @@ impl Client {
         Err(AuthError::MissingAuthClient)
     }
 
-    pub fn handle_plugin_response(&self, _plugin_response: SLoginPluginResponse) {}
+    pub async fn handle_plugin_response(&self, plugin_response: SLoginPluginResponse) {
+        log::debug!("Handling plugin for id");
+        let velocity_config = &ADVANCED_CONFIG.proxy.velocity;
+        if velocity_config.enabled {
+            let mut address = self.address.lock().await;
+            match velocity::receive_velocity_plugin_response(
+                address.port(),
+                velocity_config,
+                plugin_response,
+            ) {
+                Ok((profile, new_address)) => {
+                    self.finish_login(&profile).await;
+                    *self.gameprofile.lock().await = Some(profile);
+                    *address = new_address;
+                }
+                Err(error) => self.kick(&error.to_string()).await,
+            }
+        }
+    }
 
-    pub fn handle_login_acknowledged(
+    pub async fn handle_login_acknowledged(
         &self,
         server: &Server,
         _login_acknowledged: SLoginAcknowledged,
     ) {
+        log::debug!("Handling login acknowledged for id");
         self.connection_state.store(ConnectionState::Config);
-        self.send_packet(&server.get_branding());
+        self.send_packet(&server.get_branding()).await;
 
         let resource_config = &ADVANCED_CONFIG.resource_pack;
         if resource_config.enabled {
@@ -200,14 +292,14 @@ impl Client {
                 &resource_config.resource_pack_url,
                 &resource_config.resource_pack_sha1,
                 resource_config.force,
-                if !resource_config.prompt_message.is_empty() {
-                    Some(TextComponent::text(&resource_config.prompt_message))
-                } else {
+                if resource_config.prompt_message.is_empty() {
                     None
+                } else {
+                    Some(TextComponent::text(&resource_config.prompt_message))
                 },
             );
 
-            self.send_packet(&resource_pack);
+            self.send_packet(&resource_pack).await;
         }
 
         // known data packs
@@ -215,16 +307,20 @@ impl Client {
             namespace: "minecraft",
             id: "core",
             version: "1.21",
-        }]));
-        dbg!("login acknowledged");
+        }]))
+        .await;
+        log::debug!("login acknowledged");
     }
-    pub fn handle_client_information_config(&self, client_information: SClientInformationConfig) {
-        dbg!("got client settings");
+    pub async fn handle_client_information_config(
+        &self,
+        client_information: SClientInformationConfig,
+    ) {
+        log::debug!("Handling client settings for id");
         if let (Some(main_hand), Some(chat_mode)) = (
             Hand::from_i32(client_information.main_hand.into()),
             ChatMode::from_i32(client_information.chat_mode.into()),
         ) {
-            *self.config.lock() = Some(PlayerConfig {
+            *self.config.lock().await = Some(PlayerConfig {
                 locale: client_information.locale,
                 view_distance: client_information.view_distance,
                 chat_mode,
@@ -235,37 +331,40 @@ impl Client {
                 server_listing: client_information.server_listing,
             });
         } else {
-            self.kick("Invalid hand or chat type")
+            self.kick("Invalid hand or chat type").await;
         }
     }
 
-    pub fn handle_plugin_message(&self, plugin_message: SPluginMessage) {
+    pub async fn handle_plugin_message(&self, plugin_message: SPluginMessage) {
+        log::debug!("Handling plugin message for id");
         if plugin_message.channel.starts_with("minecraft:brand")
             || plugin_message.channel.starts_with("MC|Brand")
         {
-            dbg!("got a client brand");
+            log::debug!("got a client brand");
             match String::from_utf8(plugin_message.data) {
-                Ok(brand) => *self.brand.lock() = Some(brand),
-                Err(e) => self.kick(&e.to_string()),
+                Ok(brand) => *self.brand.lock().await = Some(brand),
+                Err(e) => self.kick(&e.to_string()).await,
             }
         }
     }
 
-    pub fn handle_known_packs(&self, server: &Server, _config_acknowledged: SKnownPacks) {
+    pub async fn handle_known_packs(&self, server: &Server, _config_acknowledged: SKnownPacks) {
+        log::debug!("Handling known packs for id");
         for registry in &server.cached_registry {
             self.send_packet(&CRegistryData::new(
                 &registry.registry_id,
                 &registry.registry_entries,
-            ));
+            ))
+            .await;
         }
 
         // We are done with configuring
-        dbg!("finish config");
-        self.send_packet(&CFinishConfig::new());
+        log::debug!("finished config");
+        self.send_packet(&CFinishConfig::new()).await;
     }
 
-    pub async fn handle_config_acknowledged(&self, _config_acknowledged: SAcknowledgeFinishConfig) {
-        dbg!("config acknowledged");
+    pub fn handle_config_acknowledged(&self, _config_acknowledged: &SAcknowledgeFinishConfig) {
+        log::debug!("Handling config acknowledge for id");
         self.connection_state.store(ConnectionState::Play);
         self.make_player
             .store(true, std::sync::atomic::Ordering::Relaxed);

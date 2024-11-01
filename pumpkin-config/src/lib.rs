@@ -61,58 +61,54 @@ pub struct BasicConfiguration {
     /// The address to bind the server to.
     #[serde(default = "default_server_address")]
     pub server_address: SocketAddr,
-
     /// The seed for world generation.
     #[serde(default = "String::new")]
     pub seed: String,
-    
-    /// The maximum number of players allowed on the server.
+    /// The maximum number of players allowed on the server. Specifying `0` disables the limit.
     #[serde_inline_default(10000)]
     pub max_players: u32,
-    
     /// The maximum view distance for players.
     #[serde_inline_default(10)]
     pub view_distance: u8,
-    
     /// The maximum simulated view distance.
     #[serde_inline_default(10)]
     pub simulation_distance: u8,
-    
     /// The default game difficulty.
     #[serde_inline_default(Difficulty::Normal)]
     pub default_difficulty: Difficulty,
-    
     /// Whether the Nether dimension is enabled.
     #[serde_inline_default(true)]
     pub allow_nether: bool,
-    
     /// Whether the server is in hardcore mode.
     #[serde_inline_default(false)]
     pub hardcore: bool,
-    
     /// Whether online mode is enabled. Requires valid Minecraft accounts.
     #[serde_inline_default(true)]
     pub online_mode: bool,
-    
     /// Whether packet encryption is enabled. Required when online mode is enabled.
     #[serde_inline_default(true)]
     pub encryption: bool,
-    
     /// The server's description displayed on the status screen.
     #[serde_inline_default("A Blazing fast Pumpkin Server!".to_string())]
     pub motd: String,
-    
+    #[serde_inline_default(20.0)]
+    pub tps: f32,
     /// The default game mode for players.
     #[serde_inline_default(GameMode::Survival)]
     pub default_gamemode: GameMode,
-    
     /// Whether to remove IPs from logs or not
     #[serde_inline_default(true)]
     pub scrub_ips: bool,
+    /// Whether to use a server favicon
+    #[serde_inline_default(true)]
+    pub use_favicon: bool,
+    /// Path to server favicon
+    #[serde_inline_default("icon.png".to_string())]
+    pub favicon_path: String,
 }
 
 fn default_server_address() -> SocketAddr {
-    SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 25565)
+    SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), 25565)
 }
 
 impl Default for BasicConfiguration {
@@ -129,8 +125,11 @@ impl Default for BasicConfiguration {
             online_mode: true,
             encryption: true,
             motd: "A Blazing fast Pumpkin Server!".to_string(),
+            tps: 20.0,
             default_gamemode: GameMode::Survival,
             scrub_ips: true,
+            use_favicon: true,
+            favicon_path: "icon.png".to_string(),
         }
     }
 }
